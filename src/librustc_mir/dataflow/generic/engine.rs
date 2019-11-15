@@ -21,15 +21,15 @@ pub struct Engine<'a, 'tcx, A>
 where
     A: Analysis<'tcx>,
 {
-    bits_per_block: usize,
     tcx: TyCtxt<'tcx>,
     body: &'a mir::Body<'tcx>,
     def_id: DefId,
     dead_unwinds: Option<&'a BitSet<BasicBlock>>,
-    entry_sets: IndexVec<BasicBlock, BitSet<A::Idx>>,
     analysis: A,
 
     /// Cached, cumulative transfer functions for each block.
+    ///
+    /// These are only computable for gen-kill problems.
     trans_for_block: Option<IndexVec<BasicBlock, GenKillSet<A::Idx>>>,
 }
 
@@ -98,25 +98,12 @@ where
         analysis: A,
         trans_for_block: Option<IndexVec<BasicBlock, GenKillSet<A::Idx>>>,
     ) -> Self {
-        let bits_per_block = analysis.bits_per_block(body);
-
-        let bottom_value_set = if A::BOTTOM_VALUE == true {
-            BitSet::new_filled(bits_per_block)
-        } else {
-            BitSet::new_empty(bits_per_block)
-        };
-
-        let mut entry_sets = IndexVec::from_elem(bottom_value_set, body.basic_blocks());
-        analysis.initialize_start_block(body, &mut entry_sets[mir::START_BLOCK]);
-
         Engine {
             analysis,
-            bits_per_block,
             tcx,
             body,
             def_id,
             dead_unwinds: None,
-            entry_sets,
             trans_for_block,
         }
     }
@@ -126,37 +113,39 @@ where
         self
     }
 
-    pub fn iterate_to_fixpoint(mut self) -> Results<'tcx, A> {
-        let mut temp_state = BitSet::new_empty(self.bits_per_block);
+    pub fn iterate_to_fixpoint(self) -> Results<'tcx, A> {
+        // Initialize the entry sets for each block.
 
-        let mut dirty_queue: WorkQueue<BasicBlock> =
-            WorkQueue::with_none(self.body.basic_blocks().len());
+        let bits_per_block = self.analysis.bits_per_block(self.body);
+        let bottom_value_set = if A::BOTTOM_VALUE == true {
+            BitSet::new_filled(bits_per_block)
+        } else {
+            BitSet::new_empty(bits_per_block)
+        };
 
-        for (bb, _) in traversal::reverse_postorder(self.body) {
-            dirty_queue.insert(bb);
-        }
+        let mut entry_sets = IndexVec::from_elem(bottom_value_set, self.body.basic_blocks());
+        self.analysis.initialize_start_block(self.body, &mut entry_sets[mir::START_BLOCK]);
 
-        // Add blocks that are not reachable from START_BLOCK to the work queue. These blocks will
-        // be processed after the ones added above.
-        for bb in self.body.basic_blocks().indices() {
-            dirty_queue.insert(bb);
-        }
-
-        while let Some(bb) = dirty_queue.pop() {
-            let bb_data = &self.body[bb];
-            let on_entry = &self.entry_sets[bb];
-
-            temp_state.overwrite(on_entry);
-            self.apply_whole_block_effect(&mut temp_state, bb, bb_data);
-
-            self.propagate_bits_into_graph_successors_of(
-                &mut temp_state,
-                (bb, bb_data),
-                &mut dirty_queue,
+        // To improve performance, we check for the existence of cached block transfer functions
+        // *outside* the loop in `_iterate_to_fixpoint` below.
+        if let Some(trans_for_block) = &self.trans_for_block {
+            self._iterate_to_fixpoint(
+                bits_per_block,
+                &mut entry_sets,
+                |state, bb| trans_for_block[bb].apply(state),
+            );
+        } else {
+            self._iterate_to_fixpoint(
+                bits_per_block,
+                &mut entry_sets,
+                |state, bb| {
+                    let block_data = &self.body[bb];
+                    apply_whole_block_effect(&self.analysis, state, bb, block_data);
+                }
             );
         }
 
-        let Engine { tcx, body, def_id, trans_for_block, entry_sets, analysis, ..  } = self;
+        let Engine { tcx, def_id, body, analysis, trans_for_block, .. } = self;
         let results = Results { analysis, entry_sets };
 
         let res = write_graphviz_results(tcx, def_id, body, &results, trans_for_block);
@@ -167,124 +156,155 @@ where
         results
     }
 
-    /// Applies the cumulative effect of an entire block, excluding the call return effect if one
-    /// exists.
-    fn apply_whole_block_effect(
+    /// Helper function that propagates dataflow state into graph succesors until fixpoint is
+    /// reached.
+    fn _iterate_to_fixpoint(
         &self,
-        state: &mut BitSet<A::Idx>,
-        block: BasicBlock,
-        block_data: &mir::BasicBlockData<'tcx>,
+        bits_per_block: usize,
+        entry_sets: &mut IndexVec<BasicBlock, BitSet<A::Idx>>,
+        apply_block_effect: impl Fn(&mut BitSet<A::Idx>, BasicBlock),
     ) {
-        // Use the cached block transfer function if available.
-        if let Some(trans_for_block) = &self.trans_for_block {
-            trans_for_block[block].apply(state);
-            return;
+        let body = self.body;
+        let mut state = BitSet::new_empty(bits_per_block);
+
+        let mut dirty_queue: WorkQueue<BasicBlock> =
+            WorkQueue::with_none(body.basic_blocks().len());
+
+        for (bb, _) in traversal::reverse_postorder(body) {
+            dirty_queue.insert(bb);
         }
 
-        // Otherwise apply effects one-by-one.
-
-        for (statement_index, statement) in block_data.statements.iter().enumerate() {
-            let location = Location { block, statement_index };
-            self.analysis.apply_before_statement_effect(state, statement, location);
-            self.analysis.apply_statement_effect(state, statement, location);
+        // Add blocks that are not reachable from START_BLOCK to the work queue. These blocks will
+        // be processed after the ones added above.
+        for bb in body.basic_blocks().indices() {
+            dirty_queue.insert(bb);
         }
 
-        let terminator = block_data.terminator();
-        let location = Location { block, statement_index: block_data.statements.len() };
-        self.analysis.apply_before_terminator_effect(state, terminator, location);
-        self.analysis.apply_terminator_effect(state, terminator, location);
+        while let Some(bb) = dirty_queue.pop() {
+            state.overwrite(&entry_sets[bb]);
+            apply_block_effect(&mut state, bb);
+
+            self.propagate_bits_into_graph_successors_of(
+                entry_sets,
+                &mut state,
+                (bb, &body[bb]),
+                &mut dirty_queue,
+            );
+        }
+    }
+
+    fn propagate_state_to(
+        &self,
+        bb: BasicBlock,
+        state: &BitSet<A::Idx>,
+        entry_sets: &mut IndexVec<BasicBlock, BitSet<A::Idx>>,
+        dirty_queue: &mut WorkQueue<BasicBlock>,
+    ) {
+        let entry_set = &mut entry_sets[bb];
+        let set_changed = self.analysis.join(entry_set, state);
+        if set_changed {
+            dirty_queue.insert(bb);
+        }
     }
 
     fn propagate_bits_into_graph_successors_of(
-        &mut self,
-        in_out: &mut BitSet<A::Idx>,
-        (bb, bb_data): (BasicBlock, &'a mir::BasicBlockData<'tcx>),
-        dirty_list: &mut WorkQueue<BasicBlock>,
+        &self,
+        entry_sets: &mut IndexVec<BasicBlock, BitSet<A::Idx>>,
+        exit_state: &mut BitSet<A::Idx>,
+        (bb, bb_data): (BasicBlock, &mir::BasicBlockData<'tcx>),
+        dirty: &mut WorkQueue<BasicBlock>,
     ) {
-        use mir::TerminatorKind::*;
-
-        // FIXME: This should be implemented using a `for_each_successor` method on
-        // `TerminatorKind`.
+        use mir::TerminatorKind;
 
         match bb_data.terminator().kind {
-            | Return
-            | Resume
-            | Abort
-            | GeneratorDrop
-            | Unreachable
+            | TerminatorKind::Return
+            | TerminatorKind::Resume
+            | TerminatorKind::Abort
+            | TerminatorKind::GeneratorDrop
+            | TerminatorKind::Unreachable
             => {}
 
-            | Goto { target }
-            | Assert { target, cleanup: None, .. }
-            | Yield { resume: target, drop: None, .. }
-            | Drop { target, location: _, unwind: None }
-            | DropAndReplace { target, value: _, location: _, unwind: None }
-            => self.propagate_bits_into_entry_set_for(in_out, target, dirty_list),
+            | TerminatorKind::Goto { target }
+            | TerminatorKind::Assert { target, cleanup: None, .. }
+            | TerminatorKind::Yield { resume: target, drop: None, .. }
+            | TerminatorKind::Drop { target, location: _, unwind: None }
+            | TerminatorKind::DropAndReplace { target, value: _, location: _, unwind: None }
+            => self.propagate_state_to(target, exit_state, entry_sets, dirty),
 
-            Yield { resume: target, drop: Some(drop), .. } => {
-                self.propagate_bits_into_entry_set_for(in_out, target, dirty_list);
-                self.propagate_bits_into_entry_set_for(in_out, drop, dirty_list);
+            TerminatorKind::Yield { resume: target, drop: Some(drop), .. } => {
+                self.propagate_state_to(target, exit_state, entry_sets, dirty);
+                self.propagate_state_to(drop, exit_state, entry_sets, dirty);
             }
 
-            | Assert { target, cleanup: Some(unwind), .. }
-            | Drop { target, location: _, unwind: Some(unwind) }
-            | DropAndReplace { target, value: _, location: _, unwind: Some(unwind) }
+            | TerminatorKind::Assert { target, cleanup: Some(unwind), .. }
+            | TerminatorKind::Drop { target, location: _, unwind: Some(unwind) }
+            | TerminatorKind::DropAndReplace { target, value: _, location: _, unwind: Some(unwind) }
             => {
-                self.propagate_bits_into_entry_set_for(in_out, target, dirty_list);
+                self.propagate_state_to(target, exit_state, entry_sets, dirty);
                 if self.dead_unwinds.map_or(true, |bbs| !bbs.contains(bb)) {
-                    self.propagate_bits_into_entry_set_for(in_out, unwind, dirty_list);
+                    self.propagate_state_to(unwind, exit_state, entry_sets, dirty);
                 }
             }
 
-            SwitchInt { ref targets, .. } => {
+            TerminatorKind::SwitchInt { ref targets, .. } => {
                 for target in targets {
-                    self.propagate_bits_into_entry_set_for(in_out, *target, dirty_list);
+                    self.propagate_state_to(*target, exit_state, entry_sets, dirty);
                 }
             }
 
-            Call { cleanup, ref destination, ref func, ref args, .. } => {
+            TerminatorKind::Call { cleanup, ref destination, ref func, ref args, .. } => {
                 if let Some(unwind) = cleanup {
                     if self.dead_unwinds.map_or(true, |bbs| !bbs.contains(bb)) {
-                        self.propagate_bits_into_entry_set_for(in_out, unwind, dirty_list);
+                        self.propagate_state_to(unwind, exit_state, entry_sets, dirty);
                     }
                 }
 
                 if let Some((ref dest_place, dest_bb)) = *destination {
                     // N.B.: This must be done *last*, otherwise the unwind path will see the call
                     // return effect.
-                    self.analysis.apply_call_return_effect(in_out, bb, func, args, dest_place);
-                    self.propagate_bits_into_entry_set_for(in_out, dest_bb, dirty_list);
+                    self.analysis.apply_call_return_effect(exit_state, bb, func, args, dest_place);
+                    self.propagate_state_to(dest_bb, exit_state, entry_sets, dirty);
                 }
             }
 
-            FalseEdges { real_target, imaginary_target } => {
-                self.propagate_bits_into_entry_set_for(in_out, real_target, dirty_list);
-                self.propagate_bits_into_entry_set_for(in_out, imaginary_target, dirty_list);
+            TerminatorKind::FalseEdges { real_target, imaginary_target } => {
+                self.propagate_state_to(real_target, exit_state, entry_sets, dirty);
+                self.propagate_state_to(imaginary_target, exit_state, entry_sets, dirty);
             }
 
-            FalseUnwind { real_target, unwind } => {
-                self.propagate_bits_into_entry_set_for(in_out, real_target, dirty_list);
+            TerminatorKind::FalseUnwind { real_target, unwind } => {
+                self.propagate_state_to(real_target, exit_state, entry_sets, dirty);
                 if let Some(unwind) = unwind {
                     if self.dead_unwinds.map_or(true, |bbs| !bbs.contains(bb)) {
-                        self.propagate_bits_into_entry_set_for(in_out, unwind, dirty_list);
+                        self.propagate_state_to(unwind, exit_state, entry_sets, dirty);
                     }
                 }
             }
         }
     }
+}
 
-    fn propagate_bits_into_entry_set_for(
-        &mut self,
-        in_out: &BitSet<A::Idx>,
-        bb: BasicBlock,
-        dirty_queue: &mut WorkQueue<BasicBlock>,
-    ) {
-        let entry_set = &mut self.entry_sets[bb];
-        let set_changed = self.analysis.join(entry_set, &in_out);
-        if set_changed {
-            dirty_queue.insert(bb);
-        }
+/// Applies the cumulative effect of an entire block, excluding the call return effect if one
+/// exists.
+fn apply_whole_block_effect<A>(
+    analysis: &'a A,
+    state: &mut BitSet<A::Idx>,
+    block: BasicBlock,
+    block_data: &'a mir::BasicBlockData<'tcx>,
+)
+where
+    A: Analysis<'tcx>,
+{
+    for (statement_index, statement) in block_data.statements.iter().enumerate() {
+        let location = Location { block, statement_index };
+        analysis.apply_before_statement_effect(state, statement, location);
+        analysis.apply_statement_effect(state, statement, location);
     }
+
+    let terminator = block_data.terminator();
+    let location = Location { block, statement_index: block_data.statements.len() };
+    analysis.apply_before_terminator_effect(state, terminator, location);
+    analysis.apply_terminator_effect(state, terminator, location);
 }
 
 // Graphviz
